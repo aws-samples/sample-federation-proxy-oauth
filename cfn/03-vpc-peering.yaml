@@ -1,0 +1,405 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stack 3 - Joins the self-managed Kafka VPC (Stack 1) and the MSK VPC (Stack 2): VPC peering,
+  routes on both sides, and a Route53 private hosted zone mapping the broker/Keycloak TLS hostname
+  to the EC2 private IP so it resolves from BOTH VPCs. Also deploys a BASTION EC2 in the MSK VPC
+  (with internet egress via a new IGW/public subnet) preloaded with Kafka + Strimzi OAuth client,
+  the source CA truststore, and OAuth client credentials -- used to prove the cross-VPC OAuth path
+  the Replicator will use. Deploy AFTER stacks 1 and 2 are CREATE_COMPLETE.
+
+Parameters:
+  SelfManagedStackName:
+    Type: String
+    Default: kafka-selfmanaged
+    Description: Name you gave Stack 1.
+  MskStackName:
+    Type: String
+    Default: kafka-msk
+    Description: Name you gave Stack 2.
+  BastionPublicSubnetCidr:
+    Type: String
+    Default: 10.20.10.0/24
+    Description: A spare CIDR inside the MSK VPC range for the bastion's public subnet.
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  KeystorePassword:
+    Type: String
+    Default: changeit
+    NoEcho: true
+    Description: Password for the bastion's local truststore (Java default; override for real use).
+
+Resources:
+  # ---- Peering + routes -----------------------------------------------------
+  Peering:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${SelfManagedStackName}-VpcId'
+      PeerVpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-peering' }]
+
+  RouteSelfToMsk:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !ImportValue
+        Fn::Sub: '${SelfManagedStackName}-RouteTableId'
+      DestinationCidrBlock: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcCidr'
+      VpcPeeringConnectionId: !Ref Peering
+
+  RouteMskToSelf:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !ImportValue
+        Fn::Sub: '${MskStackName}-RouteTableId'
+      DestinationCidrBlock: !ImportValue
+        Fn::Sub: '${SelfManagedStackName}-VpcCidr'
+      VpcPeeringConnectionId: !Ref Peering
+
+  # ---- Private DNS for the TLS hostname (both VPCs) -------------------------
+  PrivateZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: selfmanaged.internal
+      VPCs:
+        - VPCId: !ImportValue
+            Fn::Sub: '${SelfManagedStackName}-VpcId'
+          VPCRegion: !Ref AWS::Region
+        - VPCId: !ImportValue
+            Fn::Sub: '${MskStackName}-VpcId'
+          VPCRegion: !Ref AWS::Region
+      HostedZoneConfig:
+        Comment: !Sub 'Resolves the broker/Keycloak TLS hostname for MSK Replicator OAuth (${AWS::StackName})'
+
+  BrokerRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateZone
+      Name: !ImportValue
+        Fn::Sub: '${SelfManagedStackName}-BrokerHostname'
+      Type: A
+      TTL: '60'
+      ResourceRecords:
+        - !ImportValue
+            Fn::Sub: '${SelfManagedStackName}-InstancePrivateIp'
+
+  # ---- MSK Replicator prerequisites (Replicator itself is created via CLI) --
+  # The feature CFN (AWS::MSK::Replicator OAuth support) is not in prod yet, so the
+  # replicator is created with awscurl against the beta endpoint (see create-replicator.sh).
+  # These are the two supporting resources it needs, made one-click here.
+
+  # CloudWatch log group for the replicator's worker logs.
+  ReplicatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/msk/replicator/oauth-test
+      RetentionInDays: 7
+
+  # Service Execution Role (SER) the replicator assumes. The MSK Replicator service
+  # principal (kafka.amazonaws.com) assumes this role to vend credentials to the
+  # replication workers. ec2.amazonaws.com is also trusted so the role can be validated
+  # from instance-based tooling during setup. Path is /service-role/ to match what the
+  # console/service expects.
+  ReplicatorServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-replicator-ser'
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TrustKafka
+            Effect: Allow
+            Principal: { Service: kafka.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+              ArnLike: { 'aws:SourceArn': !Sub 'arn:${AWS::Partition}:kafka:*:${AWS::AccountId}:replicator/*' }
+          - Sid: TrustEc2
+            Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: replicator-oauth
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: KafkaClusterAccess
+                Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  - kafka-cluster:AlterCluster
+                  - kafka-cluster:*Topic*
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                  - kafka-cluster:WriteDataIdempotently
+                  - kafka-cluster:AlterGroup
+                  - kafka-cluster:DescribeGroup
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:kafka:*:${AWS::AccountId}:cluster/*'
+                  - !Sub 'arn:${AWS::Partition}:kafka:*:${AWS::AccountId}:topic/*/*'
+                  - !Sub 'arn:${AWS::Partition}:kafka:*:${AWS::AccountId}:group/*/*'
+                Condition:
+                  StringEquals: { 'aws:ResourceAccount': !Ref 'AWS::AccountId' }
+              - Sid: ReadSourceSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !ImportValue
+                      Fn::Sub: '${SelfManagedStackName}-SourceCaSecretArn'
+                  - !ImportValue
+                      Fn::Sub: '${SelfManagedStackName}-OAuthClientSecretArn'
+              - Sid: KmsDecryptForSecrets
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals: { 'aws:ResourceAccount': !Ref 'AWS::AccountId' }
+              - Sid: OAuthStsJwtBearer
+                Effect: Allow
+                Action: sts:GetWebIdentityToken
+                Resource: !Sub 'arn:${AWS::Partition}:sts::${AWS::AccountId}:self'
+              - Sid: ReplicatorLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt ReplicatorLogGroup.Arn
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-replicator-ser' }]
+
+  # ---- Bastion egress: IGW + public subnet in the MSK VPC -------------------
+  BastionIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-bastion-igw' }]
+
+  BastionIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      InternetGatewayId: !Ref BastionIgw
+
+  BastionSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      CidrBlock: !Ref BastionPublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-bastion-public' }]
+
+  BastionRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-bastion-rt' }]
+
+  BastionDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: BastionIgwAttach
+    Properties:
+      RouteTableId: !Ref BastionRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref BastionIgw
+
+  # Reach the self-managed VPC (Kafka + Keycloak) over the peering
+  BastionRouteToSelf:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref BastionRouteTable
+      DestinationCidrBlock: !ImportValue
+        Fn::Sub: '${SelfManagedStackName}-VpcCidr'
+      VpcPeeringConnectionId: !Ref Peering
+
+  BastionSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BastionSubnet
+      RouteTableId: !Ref BastionRouteTable
+
+  # ---- Bastion SG -----------------------------------------------------------
+  BastionSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MSK-VPC bastion (Kafka OAuth client)
+      VpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: All egress (internet + peering) }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-bastion-sg' }]
+
+  # ---- Bastion IAM ----------------------------------------------------------
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-source-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !ImportValue
+                      Fn::Sub: '${SelfManagedStackName}-SourceCaSecretArn'
+                  - !ImportValue
+                      Fn::Sub: '${SelfManagedStackName}-OAuthClientSecretArn'
+        # MSK IAM data-plane access so the bastion can produce/consume against the
+        # TARGET MSK cluster to verify replication end-to-end.
+        - PolicyName: msk-iam-verify
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:Connect
+                  - kafka-cluster:DescribeCluster
+                  - kafka-cluster:*Topic*
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                  - kafka-cluster:AlterGroup
+                  - kafka-cluster:DescribeGroup
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${MskName}-standard/*'
+                    - MskName: !Ref MskStackName
+                  - !Sub
+                    - 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:topic/${MskName}-standard/*'
+                    - MskName: !Ref MskStackName
+                  - !Sub
+                    - 'arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:group/${MskName}-standard/*'
+                    - MskName: !Ref MskStackName
+              - Effect: Allow
+                Action: kafka:GetBootstrapBrokers
+                Resource: '*'
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-bastion-role' }]
+
+  BastionProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref BastionRole]
+
+  # ---- Bastion instance -----------------------------------------------------
+  Bastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref BastionProfile
+      SubnetId: !Ref BastionSubnet
+      SecurityGroupIds: [!Ref BastionSg]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 20, VolumeType: gp3, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-bastion' }]
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            exec > /var/log/bastion-bootstrap.log 2>&1
+
+            HOST=${BrokerHost}
+            CA_SECRET=${CaSecretArn}
+            OAUTH_SECRET=${OAuthSecretArn}
+            REGION=${AWS::Region}
+            KDIR=/opt/kafka
+            KEYSTORE_PW=${KeystorePassword}
+
+            dnf update -y
+            dnf install -y java-17-amazon-corretto-headless jq tar gzip
+
+            # Kafka CLI tools
+            curl -fsSL https://archive.apache.org/dist/kafka/3.8.1/kafka_2.13-3.8.1.tgz -o /tmp/kafka.tgz
+            mkdir -p $KDIR
+            tar -xzf /tmp/kafka.tgz -C $KDIR --strip 1
+
+            # Strimzi OAuth client jars (+ deps) so the CLI can do OAUTHBEARER
+            STRIMZI_VER=0.16.2; JACKSON_VER=2.17.2; NIMBUS_VER=9.37.3
+            MC=https://repo1.maven.org/maven2
+            for JAR in \
+              io/strimzi/kafka-oauth-common/$STRIMZI_VER/kafka-oauth-common-$STRIMZI_VER.jar \
+              io/strimzi/kafka-oauth-client/$STRIMZI_VER/kafka-oauth-client-$STRIMZI_VER.jar \
+              com/nimbusds/nimbus-jose-jwt/$NIMBUS_VER/nimbus-jose-jwt-$NIMBUS_VER.jar \
+              com/fasterxml/jackson/core/jackson-databind/$JACKSON_VER/jackson-databind-$JACKSON_VER.jar \
+              com/fasterxml/jackson/core/jackson-core/$JACKSON_VER/jackson-core-$JACKSON_VER.jar \
+              com/fasterxml/jackson/core/jackson-annotations/$JACKSON_VER/jackson-annotations-$JACKSON_VER.jar \
+            ; do curl -fsSL -o $KDIR/libs/$(basename "$JAR") "$MC/$JAR"; done
+
+            # Build a truststore from the source CA (published to Secrets Manager by Stack 1).
+            # The CA secret is JSON {"certificate":"<PEM>"} (the Replicator json.Unmarshal's it),
+            # so extract .certificate before importing.
+            aws secretsmanager get-secret-value --region $REGION --secret-id "$CA_SECRET" \
+              --query SecretString --output text | jq -r .certificate > /opt/source-ca.pem
+            keytool -importcert -noprompt -alias source-ca -file /opt/source-ca.pem \
+              -keystore /opt/kafka.truststore.p12 -storetype PKCS12 -storepass $KEYSTORE_PW
+
+            # MSK IAM auth client (to produce/consume against the TARGET MSK cluster on :9098)
+            curl -fsSL -o $KDIR/libs/aws-msk-iam-auth-2.2.0-all.jar \
+              https://github.com/aws/aws-msk-iam-auth/releases/download/v2.2.0/aws-msk-iam-auth-2.2.0-all.jar
+            cat > /opt/client-iam.properties <<EOF
+            security.protocol=SASL_SSL
+            sasl.mechanism=AWS_MSK_IAM
+            sasl.jaas.config=software.amazon.msk.auth.iam.IAMLoginModule required;
+            sasl.client.callback.handler.class=software.amazon.msk.auth.iam.IAMClientCallbackHandler
+            EOF
+
+            # OAuth client credentials (client_id/client_secret) from Secrets Manager
+            CID=$(aws secretsmanager get-secret-value --region $REGION --secret-id "$OAUTH_SECRET" --query SecretString --output text | jq -r .client_id)
+            CSEC=$(aws secretsmanager get-secret-value --region $REGION --secret-id "$OAUTH_SECRET" --query SecretString --output text | jq -r .client_secret)
+
+            cat > /opt/client-oauth.properties <<EOF
+            security.protocol=SASL_SSL
+            sasl.mechanism=OAUTHBEARER
+            ssl.truststore.location=/opt/kafka.truststore.p12
+            ssl.truststore.password=$KEYSTORE_PW
+            ssl.truststore.type=PKCS12
+            sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthLoginCallbackHandler
+            sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required oauth.token.endpoint.uri="https://$HOST:8443/realms/kafka/protocol/openid-connect/token" oauth.client.id="$CID" oauth.client.secret="$CSEC" oauth.ssl.truststore.location="/opt/kafka.truststore.p12" oauth.ssl.truststore.password="$KEYSTORE_PW" oauth.ssl.truststore.type="PKCS12";
+            EOF
+
+            echo "BOOTSTRAP=$HOST:9096" > /opt/bastion-info.txt
+            echo "Bastion ready. host=$HOST region=$REGION" >> /opt/bastion-info.txt
+          - BrokerHost: !ImportValue
+              Fn::Sub: '${SelfManagedStackName}-BrokerHostname'
+            CaSecretArn: !ImportValue
+              Fn::Sub: '${SelfManagedStackName}-SourceCaSecretArn'
+            OAuthSecretArn: !ImportValue
+              Fn::Sub: '${SelfManagedStackName}-OAuthClientSecretArn'
+
+Outputs:
+  PeeringConnectionId:
+    Value: !Ref Peering
+  PrivateHostedZoneId:
+    Value: !Ref PrivateZone
+  BastionInstanceId:
+    Description: MSK-VPC bastion; SSM into it to run the OAuth client against the self-managed broker.
+    Value: !Ref Bastion
+  ReplicatorServiceRoleArn:
+    Description: SER ARN to pass to create-replicator.sh (serviceExecutionRoleArn).
+    Value: !GetAtt ReplicatorServiceRole.Arn
+    Export: { Name: !Sub '${AWS::StackName}-ReplicatorServiceRoleArn' }
+  ReplicatorLogGroup:
+    Description: CloudWatch log group for the replicator (logDelivery).
+    Value: !Ref ReplicatorLogGroup
+    Export: { Name: !Sub '${AWS::StackName}-ReplicatorLogGroup' }

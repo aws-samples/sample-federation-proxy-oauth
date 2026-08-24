@@ -1,0 +1,470 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stack 1 - Self-managed Apache Kafka (KRaft) with Strimzi OAuth + Keycloak IdP on EC2,
+  hardened for MSK Replicator CLIENT_CREDENTIALS OAuth: broker on SASL_SSL (TLS), Keycloak
+  on HTTPS behind a fixed hostname (kafka.selfmanaged.internal), a boot-generated CA published
+  to Secrets Manager (for the Replicator's rootCaCertificate / tokenEndpointTlsCertificateArn),
+  and an OAuth client-credentials secret (for the Replicator's tokenRequestSecretArn).
+  Deployable in parallel with the MSK stack. The Replicator itself is created manually later.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.10.0.0/16
+    Description: CIDR for the self-managed Kafka VPC. Must NOT overlap the MSK VPC CIDR.
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.10.1.0/24
+  InstanceType:
+    Type: String
+    Default: m5.large
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  AdminIngressCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    Description: >
+      CIDR allowed to reach SSH(22) and Keycloak admin (8080/8443) from OUTSIDE the VPC.
+      Locked down by default. Prefer SSM Session Manager over SSH.
+  MskVpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    Description: CIDR of the MSK VPC (Stack 2), pre-authorized inbound. Keep in sync with Stack 2's VpcCidr.
+  BrokerHostname:
+    Type: String
+    Default: kafka.selfmanaged.internal
+    Description: >
+      DNS name baked into the broker/Keycloak TLS certificate (SAN). Used by the Replicator as both
+      the bootstrap host and the token-endpoint host. Stack 3 creates the private DNS record for it.
+  BrokerClientSecret:
+    Type: String
+    Default: change-me-broker
+    NoEcho: true
+    Description: OAuth client secret for the Keycloak "kafka-broker" service-account client (demo value; override for real use).
+  ProducerClientSecret:
+    Type: String
+    Default: change-me-producer
+    NoEcho: true
+    Description: OAuth client secret for the Keycloak "kafka-producer" client (demo value; override for real use).
+  ConsumerClientSecret:
+    Type: String
+    Default: change-me-consumer
+    NoEcho: true
+    Description: OAuth client secret for the Keycloak "kafka-consumer" client (demo value; override for real use).
+  KeystorePassword:
+    Type: String
+    Default: changeit
+    NoEcho: true
+    Description: Password for the broker PKCS12 keystore/truststore (defaults to the Java keystore default; override for real use).
+  KeycloakAdminUser:
+    Type: String
+    Default: admin
+    Description: Keycloak bootstrap admin username (console login only; not used in the OAuth flow).
+  KeycloakAdminPassword:
+    Type: String
+    Default: change-me-admin
+    NoEcho: true
+    Description: Keycloak bootstrap admin password (demo value; override for real use).
+
+Resources:
+  # ---- Networking -----------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-vpc' }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-igw' }]
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-public' }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rt' }]
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  SubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # ---- Security group -------------------------------------------------------
+  KafkaSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Self-managed Kafka + Keycloak host (TLS)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        # From the peered MSK VPC (Replicator): Kafka SASL_SSL OAUTHBEARER listener
+        - { IpProtocol: tcp, FromPort: 9096, ToPort: 9096, CidrIp: !Ref MskVpcCidr, Description: Kafka SASL_SSL OAUTHBEARER from MSK VPC }
+        # From the peered MSK VPC: Keycloak HTTPS token/JWKS endpoints
+        - { IpProtocol: tcp, FromPort: 8443, ToPort: 8443, CidrIp: !Ref MskVpcCidr, Description: Keycloak HTTPS from MSK VPC }
+        # Admin access from outside (locked down by default)
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AdminIngressCidr, Description: SSH admin }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref AdminIngressCidr, Description: Keycloak HTTP admin (debug) }
+        - { IpProtocol: tcp, FromPort: 8443, ToPort: 8443, CidrIp: !Ref AdminIngressCidr, Description: Keycloak HTTPS admin }
+      SecurityGroupEgress:
+        # The host initiates outbound at boot: OS package updates, container image
+        # pulls (Keycloak, Kafka), Maven (Strimzi OAuth jars), and AWS APIs
+        # (Secrets Manager, SSM). Broad egress is required for bootstrap.
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: Outbound for bootstrap package/image pulls and AWS APIs }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-sg' }]
+
+  SgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref KafkaSg
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref KafkaSg
+      Description: Intra-SG traffic
+
+  # ---- Secrets --------------------------------------------------------------
+  # OAuth client-credentials secret -> Replicator tokenRequestSecretArn (CLIENT_CREDENTIALS)
+  OAuthClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-oauth-client-credentials'
+      Description: client_id/client_secret for MSK Replicator CLIENT_CREDENTIALS grant against Keycloak.
+      SecretString: !Sub '{"client_id":"kafka-producer","client_secret":"${ProducerClientSecret}"}'
+
+  # CA cert secret -> Replicator source rootCaCertificate AND tokenEndpointTlsCertificateArn.
+  # Populated at instance boot (CA is generated on the host), so created empty here.
+  SourceCaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-source-ca-cert'
+      Description: >
+        JSON {"certificate": "<PEM>"} CA that signed the Kafka broker + Keycloak certs.
+        The Replicator json.Unmarshal's this value, so it must be JSON (not raw PEM).
+        Real value set by EC2 UserData at boot.
+      SecretString: '{"certificate":"PENDING_BOOTSTRAP"}'
+
+  # ---- EC2 role -------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: publish-ca-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref SourceCaSecret
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-role' }]
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---- EC2 instance ---------------------------------------------------------
+  KafkaInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref KafkaSg]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 40, VolumeType: gp3, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-kafka-keycloak' }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/kafka-oauth-bootstrap.log 2>&1
+
+          HOSTNAME_FQDN="${BrokerHostname}"
+          CA_SECRET_ID="${SourceCaSecret}"
+          KEYSTORE_PW="${KeystorePassword}"
+
+          # --- packages: docker, compose plugin, openssl, java(keytool) ---
+          dnf update -y
+          dnf install -y docker openssl java-17-amazon-corretto-headless
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -fsSL "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
+            -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+          # --- discover private IP + region via IMDSv2 ---
+          TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+          export AWS_DEFAULT_REGION="$REGION"
+
+          # Make the TLS hostname resolvable locally (containers get it via extra_hosts)
+          echo "$PRIVATE_IP $HOSTNAME_FQDN" >> /etc/hosts
+
+          APP=/opt/kafka-oauth
+          SEC=$APP/secrets
+          mkdir -p $APP/kafka $APP/kafka-config $APP/keycloak $SEC
+
+          # ==========================================================
+          #  TLS material: self-signed CA -> broker/Keycloak server cert (SAN=hostname)
+          # ==========================================================
+          openssl req -new -x509 -nodes -days 3650 \
+            -subj "/CN=selfmanaged-ca" \
+            -keyout $SEC/ca.key -out $SEC/ca.crt
+
+          openssl req -new -nodes \
+            -subj "/CN=$HOSTNAME_FQDN" \
+            -keyout $SEC/server.key -out $SEC/server.csr
+
+          openssl x509 -req -in $SEC/server.csr -CA $SEC/ca.crt -CAkey $SEC/ca.key -CAcreateserial \
+            -days 3650 -out $SEC/server.crt \
+            -extfile <(printf "subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n" "$HOSTNAME_FQDN")
+
+          # PKCS12 keystore (broker key+cert+CA chain) and truststore (CA) for Kafka + Strimzi oauth
+          openssl pkcs12 -export -name kafka \
+            -in $SEC/server.crt -inkey $SEC/server.key -certfile $SEC/ca.crt \
+            -out $SEC/kafka.keystore.p12 -passout pass:$KEYSTORE_PW
+          keytool -importcert -noprompt -alias ca -file $SEC/ca.crt \
+            -keystore $SEC/kafka.truststore.p12 -storetype PKCS12 -storepass $KEYSTORE_PW
+          chmod 644 $SEC/*.p12 $SEC/*.crt $SEC/*.key
+
+          # Publish the CA to Secrets Manager as JSON (Replicator rootCaCertificate /
+          # tokenEndpointTlsCertificateArn). MUST be JSON with a "certificate" key — the
+          # Replicator config provider json.Unmarshal's the value; raw PEM fails with
+          # "invalid character '-' in numeric literal".
+          python3 -c "import json,sys; print(json.dumps({'certificate': open('$SEC/ca.crt').read()}))" > $SEC/ca.json
+          aws secretsmanager put-secret-value --secret-id "$CA_SECRET_ID" \
+            --secret-string "file://$SEC/ca.json"
+
+          # ==========================================================
+          #  Keycloak realm (3 OAuth clients)
+          # ==========================================================
+          cat > $APP/keycloak/realm-export.json <<'REALM'
+          {
+            "realm": "kafka",
+            "enabled": true,
+            "sslRequired": "none",
+            "clients": [
+              { "clientId": "kafka-broker",   "secret": "${BrokerClientSecret}",   "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" },
+              { "clientId": "kafka-producer", "secret": "${ProducerClientSecret}", "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" },
+              { "clientId": "kafka-consumer", "secret": "${ConsumerClientSecret}", "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" }
+            ]
+          }
+          REALM
+
+          # ==========================================================
+          #  Kafka Dockerfile (Strimzi OAuth JARs)
+          # ==========================================================
+          cat > $APP/kafka/Dockerfile <<'DOCKERFILE'
+          FROM apache/kafka:3.8.1
+          USER root
+          RUN apk add --no-cache curl
+          ENV STRIMZI_VER=0.16.2
+          ENV JACKSON_VER=2.17.2
+          ENV NIMBUS_VER=9.37.3
+          ENV MC=https://repo1.maven.org/maven2
+          RUN set -eux; \
+              for JAR in \
+                  io/strimzi/kafka-oauth-common/${!STRIMZI_VER}/kafka-oauth-common-${!STRIMZI_VER}.jar \
+                  io/strimzi/kafka-oauth-client/${!STRIMZI_VER}/kafka-oauth-client-${!STRIMZI_VER}.jar \
+                  io/strimzi/kafka-oauth-server/${!STRIMZI_VER}/kafka-oauth-server-${!STRIMZI_VER}.jar \
+                  io/strimzi/kafka-oauth-server-plain/${!STRIMZI_VER}/kafka-oauth-server-plain-${!STRIMZI_VER}.jar \
+                  com/nimbusds/nimbus-jose-jwt/${!NIMBUS_VER}/nimbus-jose-jwt-${!NIMBUS_VER}.jar \
+                  com/fasterxml/jackson/core/jackson-databind/${!JACKSON_VER}/jackson-databind-${!JACKSON_VER}.jar \
+                  com/fasterxml/jackson/core/jackson-core/${!JACKSON_VER}/jackson-core-${!JACKSON_VER}.jar \
+                  com/fasterxml/jackson/core/jackson-annotations/${!JACKSON_VER}/jackson-annotations-${!JACKSON_VER}.jar \
+              ; do \
+                  curl -fsSL -o /opt/kafka/libs/$(basename "$JAR") "${!MC}/${!JAR}"; \
+              done
+          USER appuser
+          DOCKERFILE
+
+          # ==========================================================
+          #  Kafka server.properties (SASL_SSL / OAUTHBEARER, HTTPS Keycloak)
+          #  __HOST__ substituted with the fixed TLS hostname below.
+          # ==========================================================
+          cat > $APP/kafka-config/server.properties <<'PROPS'
+          process.roles=broker,controller
+          node.id=1
+          controller.quorum.voters=1@localhost:9093
+
+          listeners=PLAINTEXT://:9092,CONTROLLER://:9093,SASL_SSL://:9096
+          advertised.listeners=PLAINTEXT://__ADV_IP__:9092,SASL_SSL://__HOST__:9096
+          listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,SASL_SSL:SASL_SSL
+          inter.broker.listener.name=PLAINTEXT
+          controller.listener.names=CONTROLLER
+
+          log.dirs=/var/lib/kafka/data
+          metadata.log.dir=/tmp/kafka-metadata
+
+          # TLS material for the SASL_SSL listener
+          listener.name.sasl_ssl.ssl.keystore.location=/etc/kafka/secrets/kafka.keystore.p12
+          listener.name.sasl_ssl.ssl.keystore.password=${KeystorePassword}
+          listener.name.sasl_ssl.ssl.keystore.type=PKCS12
+          listener.name.sasl_ssl.ssl.truststore.location=/etc/kafka/secrets/kafka.truststore.p12
+          listener.name.sasl_ssl.ssl.truststore.password=${KeystorePassword}
+          listener.name.sasl_ssl.ssl.truststore.type=PKCS12
+          listener.name.sasl_ssl.ssl.client.auth=none
+
+          sasl.enabled.mechanisms=OAUTHBEARER
+          listener.name.sasl_ssl.sasl.enabled.mechanisms=OAUTHBEARER
+          listener.name.sasl_ssl.oauthbearer.sasl.server.callback.handler.class=io.strimzi.kafka.oauth.server.JaasServerOauthValidatorCallbackHandler
+          listener.name.sasl_ssl.oauthbearer.sasl.login.callback.handler.class=io.strimzi.kafka.oauth.client.JaasClientOauthLoginCallbackHandler
+          listener.name.sasl_ssl.oauthbearer.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required \
+              oauth.valid.issuer.uri="https://__HOST__:8443/realms/kafka" \
+              oauth.jwks.endpoint.uri="https://__HOST__:8443/realms/kafka/protocol/openid-connect/certs" \
+              oauth.token.endpoint.uri="https://__HOST__:8443/realms/kafka/protocol/openid-connect/token" \
+              oauth.ssl.truststore.location="/etc/kafka/secrets/kafka.truststore.p12" \
+              oauth.ssl.truststore.password="${KeystorePassword}" \
+              oauth.ssl.truststore.type="PKCS12" \
+              oauth.client.id="kafka-broker" \
+              oauth.client.secret="${BrokerClientSecret}" \
+              oauth.username.claim="preferred_username";
+
+          auto.create.topics.enable=true
+          num.partitions=1
+          offsets.topic.replication.factor=1
+          transaction.state.log.replication.factor=1
+          transaction.state.log.min.isr=1
+          PROPS
+
+          sed -i "s/__ADV_IP__/$PRIVATE_IP/g" $APP/kafka-config/server.properties
+          sed -i "s/__HOST__/$HOSTNAME_FQDN/g" $APP/kafka-config/server.properties
+
+          # ==========================================================
+          #  docker-compose.yml
+          # ==========================================================
+          cat > $APP/docker-compose.yml <<COMPOSE
+          services:
+            keycloak:
+              image: quay.io/keycloak/keycloak:25.0
+              container_name: keycloak
+              command: start-dev --import-realm
+              environment:
+                KEYCLOAK_ADMIN: ${KeycloakAdminUser}
+                KEYCLOAK_ADMIN_PASSWORD: ${KeycloakAdminPassword}
+                KC_HOSTNAME: https://$HOSTNAME_FQDN:8443
+                KC_HTTP_ENABLED: "true"
+                KC_HTTPS_CERTIFICATE_FILE: /etc/x509/server.crt
+                KC_HTTPS_CERTIFICATE_KEY_FILE: /etc/x509/server.key
+              ports:
+                - "8080:8080"
+                - "8443:8443"
+              volumes:
+                - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+                - ./secrets/server.crt:/etc/x509/server.crt:ro
+                - ./secrets/server.key:/etc/x509/server.key:ro
+              healthcheck:
+                test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8443' 2>/dev/null"]
+                interval: 10s
+                timeout: 5s
+                retries: 30
+                start_period: 60s
+
+            kafka:
+              build: ./kafka
+              container_name: kafka
+              network_mode: host
+              extra_hosts:
+                - "$HOSTNAME_FQDN:$PRIVATE_IP"
+              environment:
+                KAFKA_HEAP_OPTS: "-Xmx1G -Xms1G"
+              volumes:
+                - ./kafka-config/server.properties:/opt/kafka/config/server.properties:ro
+                - ./secrets:/etc/kafka/secrets:ro
+                - kafka-data:/var/lib/kafka/data
+              command: >
+                bash -c "
+                  if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+                    CLUSTER_ID=\$\$(/opt/kafka/bin/kafka-storage.sh random-uuid);
+                    /opt/kafka/bin/kafka-storage.sh format -t \$\$CLUSTER_ID -c /opt/kafka/config/server.properties;
+                  fi;
+                  exec /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+                "
+              depends_on:
+                keycloak:
+                  condition: service_healthy
+
+          volumes:
+            kafka-data:
+          COMPOSE
+
+          cd $APP
+          docker compose up -d --build
+          echo "Bootstrap complete. host=$HOSTNAME_FQDN ip=$PRIVATE_IP region=$REGION"
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export: { Name: !Sub '${AWS::StackName}-VpcCidr' }
+  RouteTableId:
+    Value: !Ref RouteTable
+    Export: { Name: !Sub '${AWS::StackName}-RouteTableId' }
+  KafkaSecurityGroupId:
+    Value: !Ref KafkaSg
+    Export: { Name: !Sub '${AWS::StackName}-KafkaSgId' }
+  InstancePrivateIp:
+    Value: !GetAtt KafkaInstance.PrivateIp
+    Export: { Name: !Sub '${AWS::StackName}-InstancePrivateIp' }
+  BrokerHostname:
+    Description: TLS SAN hostname; Stack 3 maps this to the private IP via Route53.
+    Value: !Ref BrokerHostname
+    Export: { Name: !Sub '${AWS::StackName}-BrokerHostname' }
+  KafkaOAuthBootstrap:
+    Description: Replicator source bootstrapBrokerString (SASL_SSL / OAUTHBEARER).
+    Value: !Sub '${BrokerHostname}:9096'
+  KeycloakTokenEndpoint:
+    Description: Replicator tokenEndpointUrl (HTTPS).
+    Value: !Sub 'https://${BrokerHostname}:8443/realms/kafka/protocol/openid-connect/token'
+  OAuthClientSecretArn:
+    Description: Replicator tokenRequestSecretArn for CLIENT_CREDENTIALS.
+    Value: !Ref OAuthClientSecret
+    Export: { Name: !Sub '${AWS::StackName}-OAuthClientSecretArn' }
+  SourceCaSecretArn:
+    Description: Replicator source rootCaCertificate + tokenEndpointTlsCertificateArn (JSON {"certificate":"<PEM>"}, set at boot).
+    Value: !Ref SourceCaSecret
+    Export: { Name: !Sub '${AWS::StackName}-SourceCaSecretArn' }
+  InstanceId:
+    Value: !Ref KafkaInstance
+    Export: { Name: !Sub '${AWS::StackName}-InstanceId' }

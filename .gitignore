@@ -1,0 +1,25 @@
+# Build artifacts
+proxy/build/
+proxy/*.zip
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Local env / secrets — never commit
+.env
+*.pem
+*.p12
+*.key
+secrets/
+
+# OS
+.DS_Store
+
+# Local test output
+*.log
+poll.json

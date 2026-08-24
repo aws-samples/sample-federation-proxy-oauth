@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stack 4 - Federation proxy for the MSK Replicator IAM_JWT_BEARER path.
+  A VPC-attached Lambda in the MSK VPC private subnets exposes POST /token behind a PRIVATE
+  API Gateway (reached by the Replicator's ENIs through an execute-api interface VPC endpoint).
+  The proxy validates the STS JWT the Replicator presents (assertion=<STS JWT>) and exchanges
+  it for a downstream OAuth Bearer token that the self-managed Kafka trusts. In the default
+  EXCHANGE_MODE=client_credentials it mints that token from the self-managed IdP (Keycloak);
+  set EXCHANGE_MODE=token_exchange to forward the STS JWT to an IdP that federates AWS STS.
+  Deploy AFTER stacks 1-3. Create the Replicator separately with grant type IAM_JWT_BEARER and
+  tokenEndpointUrl = this stack's TokenEndpointUrl output (see scripts/create-replicator.sh).
+
+Parameters:
+  SelfManagedStackName:
+    Type: String
+    Default: selfmanaged-kafka
+    Description: Stack name of the self-managed Kafka + Keycloak stack (Stack 1).
+  MskStackName:
+    Type: String
+    Default: msk-target
+    Description: Stack name of the target MSK stack (Stack 2).
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket holding the packaged proxy zip (see scripts/package-proxy.sh).
+  LambdaCodeS3Key:
+    Type: String
+    Default: federation-proxy/proxy.zip
+  IdpClientId:
+    Type: String
+    Default: kafka-producer
+    Description: Client id the proxy uses to obtain the downstream token from the IdP.
+  IdpClientSecret:
+    Type: String
+    Default: change-me-producer
+    NoEcho: true
+    Description: Client secret for the downstream IdP client (demo value; override for real use).
+  ExchangeMode:
+    Type: String
+    Default: client_credentials
+    AllowedValues: ['client_credentials', 'token_exchange']
+    Description: >
+      How the proxy obtains the downstream token. 'client_credentials' (default) mints a token
+      from the IdP on the validated identity's behalf (fully self-contained). 'token_exchange'
+      forwards the STS JWT to an IdP that federates AWS STS as an external issuer (RFC 8693).
+  IdpScope:
+    Type: String
+    Default: ''
+    Description: Optional OAuth scope to request from the IdP.
+  ValidateStsJwt:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      'true' verifies the STS JWT signature via the STS OIDC JWKS (needs internet egress from the
+      Lambda subnets). 'false' (default) does claim-only checks (iss/aud/exp/sub) — correct for a
+      no-egress private subnet.
+  IdpCaPem:
+    Type: String
+    NoEcho: true
+    Description: >
+      Raw PEM of the CA that signed the IdP's TLS cert, so the Lambda trusts it. For the demo this
+      is the Stack 1 self-signed CA; scripts/deploy-all.sh injects it from the Stack 1 CA secret.
+  ExistingExecuteApiVpceId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. A VPC can have only one execute-api interface endpoint with private DNS enabled.
+      If the MSK VPC already has one, pass its id here to reuse it; leave empty to create one.
+
+Conditions:
+  CreateVpce: !Equals [!Ref ExistingExecuteApiVpceId, '']
+
+Resources:
+  # ---- Lambda networking: SG in the MSK VPC ---------------------------------
+  ProxyLambdaSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Federation proxy Lambda ENIs
+      VpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: To IdP over peering + VPC endpoints }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-lambda-sg' }]
+
+  # ---- execute-api interface VPC endpoint (so Replicator ENIs reach the private API) --
+  ExecuteApiVpceSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVpce
+    Properties:
+      GroupDescription: HTTPS to the execute-api VPC endpoint
+      VpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !ImportValue
+            Fn::Sub: '${MskStackName}-VpcCidr'
+          Description: HTTPS from within the MSK VPC (Replicator ENIs)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !ImportValue
+            Fn::Sub: '${MskStackName}-VpcCidr'
+          Description: HTTPS within the MSK VPC
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-execute-api-vpce-sg' }]
+
+  ExecuteApiVpce:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpce
+    Properties:
+      VpcId: !ImportValue
+        Fn::Sub: '${MskStackName}-VpcId'
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.execute-api'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Split
+        - ','
+        - !ImportValue
+            Fn::Sub: '${MskStackName}-PrivateSubnets'
+      SecurityGroupIds: [!Ref ExecuteApiVpceSg]
+
+  # ---- Lambda role ----------------------------------------------------------
+  ProxyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-lambda-role' }]
+
+  # ---- Proxy Lambda (VPC-attached, in MSK private subnets) ------------------
+  ProxyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-federation-proxy'
+      Runtime: python3.12
+      Handler: proxy.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt ProxyLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      VpcConfig:
+        SecurityGroupIds: [!Ref ProxyLambdaSg]
+        SubnetIds: !Split
+          - ','
+          - !ImportValue
+              Fn::Sub: '${MskStackName}-PrivateSubnets'
+      Environment:
+        Variables:
+          IDP_TOKEN_ENDPOINT: !Sub
+            - 'https://${Host}:8443/realms/kafka/protocol/openid-connect/token'
+            - Host: !ImportValue
+                Fn::Sub: '${SelfManagedStackName}-BrokerHostname'
+          IDP_CLIENT_ID: !Ref IdpClientId
+          IDP_CLIENT_SECRET: !Ref IdpClientSecret
+          IDP_SCOPE: !Ref IdpScope
+          EXCHANGE_MODE: !Ref ExchangeMode
+          VALIDATE_STS_JWT: !Ref ValidateStsJwt
+          # The IdP uses a private CA — the Lambda trusts it via this PEM (written to a
+          # temp file at runtime for the requests verify= path).
+          IDP_CA_PEM: !Ref IdpCaPem
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-federation-proxy'
+      RetentionInDays: 7
+
+  # ---- Private REST API Gateway ---------------------------------------------
+  # HTTP APIs cannot be private, so this uses a REST API with endpoint type PRIVATE,
+  # locked by a resource policy to the execute-api VPC endpoint.
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-federation-proxy'
+      EndpointConfiguration:
+        Types: [PRIVATE]
+        VpcEndpointIds:
+          - !If [CreateVpce, !Ref ExecuteApiVpce, !Ref ExistingExecuteApiVpceId]
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: 'execute-api:/*'
+            Condition:
+              StringEquals:
+                aws:sourceVpce: !If [CreateVpce, !Ref ExecuteApiVpce, !Ref ExistingExecuteApiVpceId]
+
+  ApiResourceToken:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: token
+
+  ApiMethodToken:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref ApiResourceToken
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProxyLambda.Arn}/invocations'
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProxyLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/token'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiMethodToken
+    Properties:
+      RestApiId: !Ref Api
+      StageName: prod
+
+Outputs:
+  TokenEndpointUrl:
+    Description: Replicator tokenEndpointUrl for the IAM_JWT_BEARER path (private API).
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod/token'
+    Export: { Name: !Sub '${AWS::StackName}-TokenEndpointUrl' }
+  ProxyLambdaName:
+    Value: !Ref ProxyLambda
+    Export: { Name: !Sub '${AWS::StackName}-ProxyLambdaName' }
+  ExecuteApiVpceId:
+    Value: !If [CreateVpce, !Ref ExecuteApiVpce, !Ref ExistingExecuteApiVpceId]

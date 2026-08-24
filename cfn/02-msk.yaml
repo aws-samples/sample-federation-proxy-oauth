@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Stack 2 - Amazon MSK Provisioned cluster (STANDARD brokers) with IAM access control,
+  in its own VPC across 3 AZs. This is the replication TARGET. IAM auth is required so
+  an MSK Replicator can target this cluster later (set up manually / separately).
+  Deployable in parallel with Stack 1. Exports VPC/subnets/SG/route-table for peering.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    Description: CIDR for the MSK VPC. Must NOT overlap the self-managed Kafka VPC CIDR.
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.20.1.0/24
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.20.2.0/24
+  PrivateSubnet3Cidr:
+    Type: String
+    Default: 10.20.3.0/24
+  KafkaVersion:
+    Type: String
+    Default: 3.6.0
+    Description: Apache Kafka version for the MSK cluster.
+  BrokerInstanceType:
+    Type: String
+    Default: kafka.m5.large
+    Description: Standard broker instance type.
+  BrokerVolumeSizeGiB:
+    Type: Number
+    Default: 100
+  SelfManagedVpcCidr:
+    Type: String
+    Default: 10.10.0.0/16
+    Description: >
+      CIDR of the self-managed Kafka VPC (Stack 1). Pre-authorizes traffic from the peered VPC.
+      Keep in sync with Stack 1's VpcCidr.
+
+Resources:
+  # ---- Networking (private subnets only; MSK needs no IGW) -------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-vpc' }]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-1' }]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-2' }]
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet3Cidr
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-private-3' }]
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-rt' }]
+
+  Subnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref RouteTable }
+  Subnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref RouteTable }
+  Subnet3RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet3, RouteTableId: !Ref RouteTable }
+
+  # ---- Security group -------------------------------------------------------
+  MskSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MSK Standard cluster
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        # IAM auth broker ports, reachable from the peered self-managed VPC and within this VPC
+        - { IpProtocol: tcp, FromPort: 9098, ToPort: 9098, CidrIp: !Ref VpcCidr, Description: IAM SASL within MSK VPC }
+        - { IpProtocol: tcp, FromPort: 9098, ToPort: 9098, CidrIp: !Ref SelfManagedVpcCidr, Description: IAM SASL from peered VPC }
+        - { IpProtocol: tcp, FromPort: 9092, ToPort: 9092, CidrIp: !Ref VpcCidr, Description: PLAINTEXT within MSK VPC }
+      SecurityGroupEgress:
+        # Explicit intra-VPC egress (no open-to-world egress). SGs are stateful, so
+        # responses to inbound broker connections are allowed regardless.
+        - { IpProtocol: -1, CidrIp: !Ref VpcCidr, Description: Intra-VPC egress }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-msk-sg' }]
+
+  MskSgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MskSg
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref MskSg
+      Description: Intra-SG traffic
+
+  # ---- Interface VPC endpoints (Secrets Manager + STS) ----------------------
+  # The MSK Replicator's ENIs land in these private subnets (no NAT/IGW) and must reach:
+  #   - Secrets Manager: fetch the source OAuth credentials + CA cert
+  #   - STS: GetWebIdentityToken for the IAM_JWT_BEARER / CLIENT_CREDENTIALS_ASSERTION grants
+  # Interface endpoints with private DNS give them those paths privately. One shared SG (443).
+  VpceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS to the Secrets Manager + STS VPC endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref VpcCidr, Description: HTTPS from within MSK VPC (Replicator ENIs) }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: !Ref VpcCidr, Description: HTTPS within MSK VPC }
+      Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-vpce-sg' }]
+
+  SecretsManagerVpce:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds: [!Ref VpceSg]
+
+  # STS interface endpoint: the Replicator calls sts:GetWebIdentityToken (IAM_JWT_BEARER /
+  # CLIENT_CREDENTIALS_ASSERTION grants) from these no-egress subnets. Without this the call
+  # times out ("STS GetWebIdentityToken call failed: Connect timed out"). Reuses the same SG.
+  StsVpce:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds: [!Ref VpceSg]
+
+  # ---- Logging --------------------------------------------------------------
+  MskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/msk/${AWS::StackName}'
+      RetentionInDays: 7
+
+  # ---- MSK Standard cluster -------------------------------------------------
+  MskCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-standard'
+      KafkaVersion: !Ref KafkaVersion
+      NumberOfBrokerNodes: 3
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref BrokerInstanceType
+        ClientSubnets:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+          - !Ref PrivateSubnet3
+        SecurityGroups: [!Ref MskSg]
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: !Ref BrokerVolumeSizeGiB
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true    # Required: MSK Replicator uses IAM auth on the target cluster
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      EnhancedMonitoring: PER_TOPIC_PER_BROKER
+      LoggingInfo:
+        BrokerLogs:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup: !Ref MskLogGroup
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export: { Name: !Sub '${AWS::StackName}-VpcCidr' }
+  RouteTableId:
+    Value: !Ref RouteTable
+    Export: { Name: !Sub '${AWS::StackName}-RouteTableId' }
+  MskSecurityGroupId:
+    Value: !Ref MskSg
+    Export: { Name: !Sub '${AWS::StackName}-MskSgId' }
+  PrivateSubnets:
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2, !Ref PrivateSubnet3]]
+    Export: { Name: !Sub '${AWS::StackName}-PrivateSubnets' }
+  MskClusterArn:
+    Description: Use as the Replicator TARGET cluster ARN.
+    Value: !Ref MskCluster
+    Export: { Name: !Sub '${AWS::StackName}-MskClusterArn' }

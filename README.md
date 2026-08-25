@@ -1,16 +1,16 @@
 # federation-proxy-oauth
 
 A complete, runnable reference for migrating a **self-managed, OAuth-authenticated
-Apache Kafka** cluster to **Amazon MSK** with **MSK Replicator**, where the source
-Kafka's identity provider sits behind an enterprise **federation / token-exchange**
-chain instead of a plain OAuth endpoint.
+Apache Kafka** cluster to **Amazon Managed Streaming for Apache Kafka (Amazon MSK)**
+with **Amazon MSK Replicator**, where the source Kafka's identity provider sits behind
+an enterprise **federation / token-exchange** chain instead of a plain OAuth endpoint.
 
-It deploys everything end to end — the OAuth IdP, the self-managed Kafka source, the
-target MSK cluster, the network path, and a **federation proxy** that lets MSK
-Replicator authenticate through a multi-hop identity chain using a single, standard
-OAuth token endpoint.
+It deploys most of the components you need — the OAuth IdP, the self-managed Kafka
+source, the target Amazon MSK cluster, the network path, and a **federation proxy**
+that lets Amazon MSK Replicator authenticate through a multi-hop identity chain using a
+single, standard OAuth token endpoint.
 
-> Why this exists: MSK Replicator's OAuth contract is intentionally narrow — one
+> Why this exists: Amazon MSK Replicator's OAuth contract is intentionally narrow — one
 > token endpoint, one grant type, a standard token response. Enterprises whose real
 > auth path is multi-hop (identity federation, token exchange, claim enrichment, an
 > IdP that needs mutual TLS) can't expose that directly. The **federation proxy**
@@ -26,16 +26,16 @@ OAuth token endpoint.
 | 3 | `cfn/03-vpc-peering.yaml` | VPC peering + private DNS + Replicator Service Execution Role + a bastion for smoke tests |
 | 4 | `cfn/04-federation-proxy.yaml` | VPC-attached Lambda behind a **private** API Gateway — the federation proxy (`POST /token`) |
 
-The MSK Replicator itself is created by `scripts/create-replicator.sh` (grant type
+The Amazon MSK Replicator itself is created by `scripts/create-replicator.sh` (grant type
 `IAM_JWT_BEARER`), not by CloudFormation.
 
 ```
- Self-managed VPC (10.10.0.0/16)                 MSK VPC (10.20.0.0/16)
-┌──────────────────────────────┐   VPC peering ┌────────────────────────────────────┐
-│  Kafka (KRaft) SASL_SSL :9096 │◀─────────────▶│  MSK (3 brokers, IAM auth)          │
-│  Keycloak IdP :8443           │  + private    │  MSK Replicator ENIs ──▶ federation │
-│  realm "kafka"                │    DNS zone   │  proxy Lambda (private API /token)  │
-└──────────────────────────────┘               └────────────────────────────────────┘
+ Self-managed VPC (10.10.0.0/16)                 Amazon MSK VPC (10.20.0.0/16)
+┌──────────────────────────────┐   VPC peering ┌─────────────────────────────────────────────┐
+│  Kafka (KRaft) SASL_SSL :9096 │◀─────────────▶│  Amazon MSK (3 brokers, IAM auth)           │
+│  Keycloak IdP :8443           │  + private    │  Amazon MSK Replicator ENIs ──▶ federation  │
+│  realm "kafka"                │    DNS zone   │  proxy Lambda (private API /token)          │
+└──────────────────────────────┘               └─────────────────────────────────────────────┘
 ```
 
 ## Repository layout
@@ -54,7 +54,7 @@ docs/      Architecture and token-flow documentation
 - [`awscurl`](https://github.com/okigan/awscurl) — only if you submit the replicator
   via a preview endpoint (`REPLICATOR_API_BASE`); not needed for the public path.
 - An S3 bucket you own (for the packaged proxy Lambda zip).
-- MSK Replicator OAuth authentication available in your account/region.
+- Amazon MSK Replicator OAuth authentication available in your account/region.
 
 ## Configuration
 
@@ -150,7 +150,7 @@ REPLICATOR_NAME=<name-printed-by-step-3> PROFILE=my-aws-profile ./scripts/descri
 ```
 
 Produce a few records to a topic on the source Kafka and confirm they appear on the
-target MSK cluster (the Stack 3 bastion is preconfigured with Kafka CLI clients for
+target Amazon MSK cluster (the Stack 3 bastion is preconfigured with Kafka CLI clients for
 both the OAuth source and the IAM target).
 
 ## The federation proxy

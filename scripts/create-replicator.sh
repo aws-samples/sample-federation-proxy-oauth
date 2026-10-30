@@ -20,7 +20,8 @@
 #                        the KRaft cluster.id of the self-managed Kafka; see README)
 #   REGION               default: us-east-1
 #   REPLICATOR_NAME      default: federation-proxy-repl-<HHMMSS>
-#   AUDIENCE             default: kafka   (aud claim minted into the STS JWT)
+#   AUDIENCE             default: the proxy stack's TrustedAudience output (aud claim minted
+#                        into the STS JWT; the proxy rejects any other value)
 #   SIGNING_ALGORITHM    default: RS256
 #   TOPICS_REGEX         default: .*
 #   REPLICATOR_API_BASE  optional. If set (e.g. a preview REST base URL), the request is
@@ -34,7 +35,6 @@ SELF_MANAGED_STACK="${SELF_MANAGED_STACK:-selfmanaged-kafka}"
 MSK_STACK="${MSK_STACK:-msk-target}"
 PEERING_STACK="${PEERING_STACK:-vpc-peering}"
 PROXY_STACK="${PROXY_STACK:-federation-proxy}"
-AUDIENCE="${AUDIENCE:-kafka}"
 SIGNING_ALGORITHM="${SIGNING_ALGORITHM:-RS256}"
 TOPICS_REGEX="${TOPICS_REGEX:-.*}"
 : "${SOURCE_CLUSTER_ID:?set SOURCE_CLUSTER_ID to the self-managed Kafka KRaft cluster.id}"
@@ -56,6 +56,7 @@ MSK_SG=$(out "$MSK_STACK" MskSecurityGroupId)
 SOURCE_BOOTSTRAP="$(out "$SELF_MANAGED_STACK" BrokerHostname):9096"
 CA_SECRET=$(out "$SELF_MANAGED_STACK" SourceCaSecretArn)
 TOKEN_URL=$(out "$PROXY_STACK" TokenEndpointUrl)
+AUDIENCE="${AUDIENCE:-$(out "$PROXY_STACK" TrustedAudience)}"
 
 SUBNETS_JSON=$(python3 -c "import sys,json;print(json.dumps(sys.argv[1].split(',')))" "$SUBNETS_CSV")
 REPL_NAME="${REPLICATOR_NAME:-federation-proxy-repl-$(date +%H%M%S)}"

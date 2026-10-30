@@ -12,6 +12,10 @@
 #   PROFILE     (optional) AWS CLI profile
 #   REGION      (optional) default us-east-1
 #   EXCHANGE_MODE (optional) client_credentials (default) | token_exchange
+#   TRUSTED_ISSUER (optional) STS issuer the proxy trusts. Default: this account's outbound
+#                 identity federation issuer (must be enabled; see README).
+#   AUDIENCE    (optional) audience the Replicator requests and the proxy enforces.
+#               Default: federation-proxy-<PROXY_STACK>
 set -euo pipefail
 
 : "${S3_BUCKET:?set S3_BUCKET to an S3 bucket you own (for the proxy Lambda zip)}"
@@ -24,6 +28,20 @@ SELF_MANAGED_STACK="${SELF_MANAGED_STACK:-selfmanaged-kafka}"
 MSK_STACK="${MSK_STACK:-msk-target}"
 PEERING_STACK="${PEERING_STACK:-vpc-peering}"
 PROXY_STACK="${PROXY_STACK:-federation-proxy}"
+AUDIENCE="${AUDIENCE:-federation-proxy-${PROXY_STACK}}"
+
+# The proxy only accepts STS JWTs signed by this account's outbound identity federation
+# issuer, so resolve (and require) it before deploying anything.
+if [ -z "${TRUSTED_ISSUER:-}" ]; then
+  TRUSTED_ISSUER=$(aws iam get-outbound-web-identity-federation-info ${PROFILE_ARG} \
+    --query IssuerIdentifier --output text 2>/dev/null || true)
+fi
+case "${TRUSTED_ISSUER:-}" in
+  https://*) ;;
+  *) echo "Could not resolve the STS outbound identity federation issuer for this account."
+     echo "Enable it once with:  aws iam enable-outbound-web-identity-federation"
+     echo "or set TRUSTED_ISSUER=https://<id>.tokens.sts.global.api.aws"; exit 1 ;;
+esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CFN="${ROOT}/cfn"
@@ -62,6 +80,8 @@ CA_PEM=$(aws secretsmanager get-secret-value --secret-id "$CA_SECRET_ARN" --regi
 deploy "$PROXY_STACK" "${CFN}/04-federation-proxy.yaml" --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     "SelfManagedStackName=${SELF_MANAGED_STACK}" "MskStackName=${MSK_STACK}" \
+    "PeeringStackName=${PEERING_STACK}" \
+    "TrustedIssuers=${TRUSTED_ISSUER}" "TrustedAudience=${AUDIENCE}" \
     "LambdaCodeS3Bucket=${S3_BUCKET}" "LambdaCodeS3Key=federation-proxy/proxy.zip" \
     "ExchangeMode=${EXCHANGE_MODE}" "IdpCaPem=${CA_PEM}"
 

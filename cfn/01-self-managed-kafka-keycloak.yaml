@@ -37,21 +37,6 @@ Parameters:
     Description: >
       DNS name baked into the broker/Keycloak TLS certificate (SAN). Used by the Replicator as both
       the bootstrap host and the token-endpoint host. Stack 3 creates the private DNS record for it.
-  BrokerClientSecret:
-    Type: String
-    Default: change-me-broker
-    NoEcho: true
-    Description: OAuth client secret for the Keycloak "kafka-broker" service-account client (demo value; override for real use).
-  ProducerClientSecret:
-    Type: String
-    Default: change-me-producer
-    NoEcho: true
-    Description: OAuth client secret for the Keycloak "kafka-producer" client (demo value; override for real use).
-  ConsumerClientSecret:
-    Type: String
-    Default: change-me-consumer
-    NoEcho: true
-    Description: OAuth client secret for the Keycloak "kafka-consumer" client (demo value; override for real use).
   KeystorePassword:
     Type: String
     Default: changeit
@@ -61,11 +46,6 @@ Parameters:
     Type: String
     Default: admin
     Description: Keycloak bootstrap admin username (console login only; not used in the OAuth flow).
-  KeycloakAdminPassword:
-    Type: String
-    Default: change-me-admin
-    NoEcho: true
-    Description: Keycloak bootstrap admin password (demo value; override for real use).
 
 Resources:
   # ---- Networking -----------------------------------------------------------
@@ -148,13 +128,54 @@ Resources:
       Description: Intra-SG traffic
 
   # ---- Secrets --------------------------------------------------------------
-  # OAuth client-credentials secret -> Replicator tokenRequestSecretArn (CLIENT_CREDENTIALS)
+  # Keycloak client secrets and the admin password are generated per deployment (no
+  # default credentials). The instance reads them from Secrets Manager at boot.
+  #
+  # OAuth client-credentials secret -> Replicator tokenRequestSecretArn (CLIENT_CREDENTIALS),
+  # and the federation proxy's downstream IdP credentials (Stack 4).
   OAuthClientSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub '${AWS::StackName}-oauth-client-credentials'
-      Description: client_id/client_secret for MSK Replicator CLIENT_CREDENTIALS grant against Keycloak.
-      SecretString: !Sub '{"client_id":"kafka-producer","client_secret":"${ProducerClientSecret}"}'
+      Description: client_id/client_secret for the Keycloak kafka-producer client (Replicator CLIENT_CREDENTIALS / federation proxy).
+      GenerateSecretString:
+        SecretStringTemplate: '{"client_id":"kafka-producer"}'
+        GenerateStringKey: client_secret
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  BrokerClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-keycloak-broker-client'
+      Description: client_secret for the Keycloak kafka-broker service-account client.
+      GenerateSecretString:
+        SecretStringTemplate: '{"client_id":"kafka-broker"}'
+        GenerateStringKey: client_secret
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  ConsumerClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-keycloak-consumer-client'
+      Description: client_secret for the Keycloak kafka-consumer client.
+      GenerateSecretString:
+        SecretStringTemplate: '{"client_id":"kafka-consumer"}'
+        GenerateStringKey: client_secret
+        PasswordLength: 40
+        ExcludePunctuation: true
+
+  KeycloakAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-keycloak-admin'
+      Description: Keycloak bootstrap admin console password.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${KeycloakAdminUser}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
 
   # CA cert secret -> Replicator source rootCaCertificate AND tokenEndpointTlsCertificateArn.
   # Populated at instance boot (CA is generated on the host), so created empty here.
@@ -190,6 +211,17 @@ Resources:
                   - secretsmanager:PutSecretValue
                   - secretsmanager:DescribeSecret
                 Resource: !Ref SourceCaSecret
+        - PolicyName: read-generated-credentials
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref OAuthClientSecret
+                  - !Ref BrokerClientSecret
+                  - !Ref ConsumerClientSecret
+                  - !Ref KeycloakAdminSecret
       Tags: [{ Key: Name, Value: !Sub '${AWS::StackName}-role' }]
 
   InstanceProfile:
@@ -235,6 +267,16 @@ Resources:
           PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
           REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
           export AWS_DEFAULT_REGION="$REGION"
+
+          # --- generated credentials (Secrets Manager); not traced into the boot log ---
+          set +x
+          secret_field() { aws secretsmanager get-secret-value --secret-id "$1" \
+            --query SecretString --output text | python3 -c "import sys,json;print(json.load(sys.stdin)[sys.argv[1]])" "$2"; }
+          PRODUCER_SECRET=$(secret_field "${OAuthClientSecret}" client_secret)
+          BROKER_SECRET=$(secret_field "${BrokerClientSecret}" client_secret)
+          CONSUMER_SECRET=$(secret_field "${ConsumerClientSecret}" client_secret)
+          KC_ADMIN_PW=$(secret_field "${KeycloakAdminSecret}" password)
+          set -x
 
           # Make the TLS hostname resolvable locally (containers get it via extra_hosts)
           echo "$PRIVATE_IP $HOSTNAME_FQDN" >> /etc/hosts
@@ -283,9 +325,9 @@ Resources:
             "enabled": true,
             "sslRequired": "none",
             "clients": [
-              { "clientId": "kafka-broker",   "secret": "${BrokerClientSecret}",   "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" },
-              { "clientId": "kafka-producer", "secret": "${ProducerClientSecret}", "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" },
-              { "clientId": "kafka-consumer", "secret": "${ConsumerClientSecret}", "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" }
+              { "clientId": "kafka-broker",   "secret": "__BROKER_SECRET__",   "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" },
+              { "clientId": "kafka-producer", "secret": "__PRODUCER_SECRET__", "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" },
+              { "clientId": "kafka-consumer", "secret": "__CONSUMER_SECRET__", "publicClient": false, "serviceAccountsEnabled": true, "directAccessGrantsEnabled": false, "standardFlowEnabled": false, "protocol": "openid-connect" }
             ]
           }
           REALM
@@ -356,7 +398,7 @@ Resources:
               oauth.ssl.truststore.password="${KeystorePassword}" \
               oauth.ssl.truststore.type="PKCS12" \
               oauth.client.id="kafka-broker" \
-              oauth.client.secret="${BrokerClientSecret}" \
+              oauth.client.secret="__BROKER_SECRET__" \
               oauth.username.claim="preferred_username";
 
           auto.create.topics.enable=true
@@ -368,6 +410,11 @@ Resources:
 
           sed -i "s/__ADV_IP__/$PRIVATE_IP/g" $APP/kafka-config/server.properties
           sed -i "s/__HOST__/$HOSTNAME_FQDN/g" $APP/kafka-config/server.properties
+          set +x
+          sed -i -e "s/__BROKER_SECRET__/$BROKER_SECRET/g" -e "s/__PRODUCER_SECRET__/$PRODUCER_SECRET/g" \
+            -e "s/__CONSUMER_SECRET__/$CONSUMER_SECRET/g" \
+            $APP/keycloak/realm-export.json $APP/kafka-config/server.properties
+          set -x
 
           # ==========================================================
           #  docker-compose.yml
@@ -380,7 +427,7 @@ Resources:
               command: start-dev --import-realm
               environment:
                 KEYCLOAK_ADMIN: ${KeycloakAdminUser}
-                KEYCLOAK_ADMIN_PASSWORD: ${KeycloakAdminPassword}
+                KEYCLOAK_ADMIN_PASSWORD: $KC_ADMIN_PW
                 KC_HOSTNAME: https://$HOSTNAME_FQDN:8443
                 KC_HTTP_ENABLED: "true"
                 KC_HTTPS_CERTIFICATE_FILE: /etc/x509/server.crt
@@ -457,6 +504,9 @@ Outputs:
   KeycloakTokenEndpoint:
     Description: Replicator tokenEndpointUrl (HTTPS).
     Value: !Sub 'https://${BrokerHostname}:8443/realms/kafka/protocol/openid-connect/token'
+  KeycloakAdminSecretArn:
+    Description: Generated Keycloak admin console credentials.
+    Value: !Ref KeycloakAdminSecret
   OAuthClientSecretArn:
     Description: Replicator tokenRequestSecretArn for CLIENT_CREDENTIALS.
     Value: !Ref OAuthClientSecret

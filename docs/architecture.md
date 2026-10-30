@@ -62,9 +62,9 @@ Replicator                Federation proxy            Enterprise IdP (Keycloak) 
     │ 2. POST /token           │                              │                          │
     │   grant_type=jwt-bearer  │                              │                          │
     │   assertion=<STS JWT> ──▶ │                              │                          │
-    │                          │ 3. validate STS JWT          │                          │
-    │                          │    (iss/aud/exp; sub is ARN; │                          │
-    │                          │     optional JWKS signature) │                          │
+    │                          │ 3. verify STS JWT signature  │                          │
+    │                          │    (trusted issuer's JWKS);  │                          │
+    │                          │    enforce iss/aud/exp/sub   │                          │
     │                          │ 4. exchange for downstream ─▶ │                          │
     │                          │    token (client_credentials │                          │
     │                          │    or RFC 8693 token-exchange)│                          │
@@ -79,8 +79,13 @@ Replicator                Federation proxy            Enterprise IdP (Keycloak) 
 
 The Replicator obtains a signed JWT representing **its own IAM identity** from AWS
 STS (`GetWebIdentityToken`), then presents that JWT to the proxy as the OAuth
-`assertion`. The proxy validates it and returns a downstream Bearer that the source
-Kafka brokers trust.
+`assertion`. The proxy verifies its signature against the trusted STS issuer's JWKS,
+enforces the issuer, audience, expiry and subject (the Replicator role), and only then
+returns a downstream Bearer that the source Kafka brokers trust.
+
+The token endpoint has no API Gateway authorizer, so this JWT is the caller's only
+credential: anything that can reach the endpoint can send a request, and only a JWT that
+AWS STS signed for the Replicator role gets a token back.
 
 ## Exchange modes
 
@@ -100,11 +105,16 @@ the raw STS JWT; output is an `access_token` string.
 
 - The proxy API is a **private** REST API Gateway, locked by a resource policy to
   the `execute-api` VPC endpoint — it is not reachable from the internet.
-- The proxy runs in **private subnets** with no inbound internet path. With
-  `VALIDATE_STS_JWT=false` it performs claim-only validation (issuer allowlist,
-  audience allowlist, expiry, and that the subject is an AWS ARN), which needs no
-  egress. Set `VALIDATE_STS_JWT=true` (and give the subnets egress to the STS OIDC
-  JWKS) to additionally verify the STS JWT signature.
-- Downstream client secrets are passed as Lambda environment via a `NoEcho`
-  CloudFormation parameter; in production, source them from AWS Secrets Manager.
+- Only the Replicator ENIs' security group may reach the `execute-api` endpoint.
+- The proxy always verifies the STS JWT signature; there is no claim-only mode, since
+  unsigned claims are attacker-controlled. It refuses to start without non-empty issuer,
+  audience and subject allowlists, fetches keys only for allowlisted issuers (never from
+  a URL named in the token), pins the accepted algorithms, and requires `exp`/`iat`
+  with a bounded lifetime.
+- The proxy runs in **private subnets** with no internet egress. A scheduled, non-VPC
+  refresher Lambda copies the trusted issuer's public JWKS into Secrets Manager; the
+  proxy reads it through the VPC's Secrets Manager interface endpoint. Unknown key ids
+  trigger a rate-limited re-read to follow key rotation.
+- Downstream IdP credentials are generated in AWS Secrets Manager by Stack 1 and read
+  by the proxy at runtime; no default credentials exist.
 - The Replicator authenticates to the target MSK with IAM (no shared secret).

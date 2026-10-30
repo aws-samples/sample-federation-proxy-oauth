@@ -55,50 +55,34 @@ docs/      Architecture and token-flow documentation
   via a preview endpoint (`REPLICATOR_API_BASE`); not needed for the public path.
 - An S3 bucket you own (for the packaged proxy Lambda zip).
 - Amazon MSK Replicator OAuth authentication available in your account/region.
+- **IAM outbound identity federation enabled** in the account, so the Replicator can mint
+  signed STS JWTs and the proxy can verify them. Enable it once with
+  `aws iam enable-outbound-web-identity-federation`; the issuer URL the proxy trusts is
+  `aws iam get-outbound-web-identity-federation-info --query IssuerIdentifier`.
 
 ## Configuration
 
-All credentials are CloudFormation parameters — there are **no secrets hardcoded** in
-the templates. The defaults are deliberately weak demo placeholders (`change-me-*`, the
-Java keystore default `changeit`). **They are internally consistent, so the demo works
-end to end with the defaults unchanged** — but you should override them for any real or
-long-lived deployment.
+There are **no default credentials**. Stack 1 generates the Keycloak client secrets
+(`kafka-broker`, `kafka-producer`, `kafka-consumer`) and the Keycloak admin password in
+AWS Secrets Manager at deploy time; the instance reads them at boot. The federation proxy
+reads the `kafka-producer` credentials from the same secret, so nothing has to be kept in
+sync by hand. The only remaining password parameter is the local keystore password.
 
-| Stack | Parameter | Default | Change it for real use? |
-|-------|-----------|---------|--------------------------|
-| 1 | `BrokerClientSecret` | `change-me-broker` | **Yes** — Keycloak `kafka-broker` client secret |
-| 1 | `ProducerClientSecret` | `change-me-producer` | **Yes** — Keycloak `kafka-producer` client secret |
-| 1 | `ConsumerClientSecret` | `change-me-consumer` | **Yes** — Keycloak `kafka-consumer` client secret |
-| 1 | `KeystorePassword` | `changeit` | Recommended — broker PKCS12 keystore/truststore password |
-| 1 | `KeycloakAdminPassword` | `change-me-admin` | **Yes** — Keycloak admin console login |
-| 1 | `KeycloakAdminUser` | `admin` | Optional — Keycloak admin username (not a secret) |
-| 3 | `KeystorePassword` | `changeit` | Recommended — bastion truststore password |
-| 4 | `IdpClientId` | `kafka-producer` | Maybe — the client the proxy uses at the IdP |
-| 4 | `IdpClientSecret` | `change-me-producer` | **Yes** — **must equal Stack 1 `ProducerClientSecret`** |
+| Stack | Parameter | Default | Notes |
+|-------|-----------|---------|-------|
+| 1 | `KeystorePassword` | `changeit` | Recommended to override — broker PKCS12 keystore/truststore password |
+| 1 | `KeycloakAdminUser` | `admin` | Optional — Keycloak admin username (password is generated; see output `KeycloakAdminSecretArn`) |
+| 3 | `KeystorePassword` | `changeit` | Recommended to override — bastion truststore password |
+| 4 | `TrustedIssuers` | **required** | STS outbound identity federation issuer URL(s) (`deploy-all.sh` resolves it) |
+| 4 | `TrustedAudience` | **required** | Audience the Replicator requests (`deploy-all.sh` default: `federation-proxy-<stack>`) |
+| 4 | `TrustedSubjects` | `` → Stack 3 Replicator role | IAM role ARN(s) allowed to obtain a token |
+| 4 | `PeeringStackName` | `vpc-peering` | Stack 3 name (source of the Replicator role ARN) |
+| 4 | `IdpClientSecretArn` | `` → Stack 1 `kafka-producer` secret | Secret `{"client_id","client_secret"}` the proxy uses at the IdP |
+| 4 | `IdpClientId` | `` (from the secret) | Optional client id override |
+| 4 | `TokenClientSecurityGroupId` | `` → Stack 2 MSK SG | The only security group allowed to reach the token endpoint (Replicator ENIs) |
 | 4 | `ExchangeMode` | `client_credentials` | Optional — `client_credentials` or `token_exchange` |
 | 4 | `IdpScope` | `` (empty) | Optional — OAuth scope requested downstream |
-| 4 | `ValidateStsJwt` | `false` | Set `true` to verify the STS JWT signature (needs egress) |
 | 4 | `ExistingExecuteApiVpceId` | `` (empty) | Set if the VPC already has an `execute-api` endpoint |
-
-**Important:** the federation proxy authenticates to Keycloak as `IdpClientId` using
-`IdpClientSecret`, so **Stack 4 `IdpClientSecret` must match Stack 1 `ProducerClientSecret`**
-(both default to `change-me-producer`). If you change one, change the other.
-
-To override any of these, pass `--parameter-overrides` on the relevant stack deploy, e.g.:
-
-```bash
-aws cloudformation deploy --stack-name selfmanaged-kafka \
-  --template-file cfn/01-self-managed-kafka-keycloak.yaml --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-    BrokerClientSecret='<strong-secret>' \
-    ProducerClientSecret='<strong-secret>' \
-    ConsumerClientSecret='<strong-secret>' \
-    KeycloakAdminPassword='<strong-secret>' \
-    KeystorePassword='<strong-secret>'
-```
-
-For real deployments, generate secrets with e.g. `openssl rand -base64 24` and store them
-in a secrets manager rather than passing them on the command line.
 
 ## Quick start
 
@@ -108,13 +92,12 @@ in a secrets manager rather than passing them on the command line.
 S3_BUCKET=my-artifacts-bucket PROFILE=my-aws-profile ./scripts/deploy-all.sh
 ```
 
-This deploys stacks 1 and 2 in parallel, then stack 3, then packages the proxy and
+The script resolves the account's STS issuer (override with `TRUSTED_ISSUER=`) and stops
+if outbound identity federation is not enabled. This deploys stacks 1 and 2 in parallel, then stack 3, then packages the proxy and
 deploys stack 4. Stack 1's EC2 bootstrap (Keycloak + Kafka + a self-signed CA) takes
 a few minutes after the stack completes; the CA is published to Secrets Manager and
 consumed automatically. When it finishes it prints the proxy's token endpoint URL.
 
-The demo runs with the default credentials as-is; for real use, override the parameters
-in [Configuration](#configuration) first.
 
 > If the target VPC already has an `execute-api` interface endpoint with private DNS,
 > pass its id so the proxy reuses it instead of creating a conflicting one:
@@ -142,7 +125,7 @@ from the CloudFormation stack outputs — nothing is hardcoded.
 ### 4. Verify
 
 ```bash
-# Smoke-test the proxy directly (validates request -> STS-claim check -> downstream mint):
+# Smoke-test the proxy directly: forged/unsigned STS JWTs must be rejected with 401:
 PROFILE=my-aws-profile PROXY_STACK=federation-proxy ./scripts/smoke-test.sh
 
 # Poll the replicator until RUNNING:
@@ -184,12 +167,21 @@ python -m pytest -q
 
 - The proxy API is a **private** REST API Gateway, locked by resource policy to the
   VPC's `execute-api` endpoint — not reachable from the internet.
-- The proxy runs in **private subnets**. By default it does claim-only validation of
-  the STS JWT (issuer/audience allowlists, expiry, subject must be an AWS ARN), which
-  needs no egress. Set `VALIDATE_STS_JWT=true` (and give the subnets egress to the STS
-  OIDC JWKS) to also verify the token signature.
-- Downstream client secrets are injected via `NoEcho` CloudFormation parameters; in
-  production, source them from AWS Secrets Manager.
+- The token endpoint has no API Gateway authorizer (the Replicator does not SigV4-sign
+  token requests), so **the STS JWT is the caller's credential** and the proxy always
+  verifies it cryptographically: signature against the trusted issuer's JWKS, plus
+  issuer, audience, expiry/lifetime, and `sub` pinned to the Replicator role. There is
+  no claim-only mode — unsigned claims are attacker-controlled and prove nothing. The
+  proxy refuses to start if the issuer, audience or subject allowlist is empty.
+- The proxy runs in **private subnets with no internet egress**. A scheduled, non-VPC
+  refresher Lambda copies the trusted issuer's public JWKS into Secrets Manager hourly
+  (and at deploy time); the proxy reads it through the VPC's Secrets Manager endpoint.
+- Only the Replicator ENIs' security group can reach the `execute-api` endpoint, and the
+  proxy Lambda can only reach the Secrets Manager endpoint and Keycloak.
+- Downstream IdP credentials are generated in and read from AWS Secrets Manager; they
+  are not passed as parameters or Lambda environment variables.
+- The demo source broker has no Kafka authorizer: any valid IdP token has full access to
+  the source cluster. Add ACLs before using this pattern beyond a demo.
 - Never commit real credentials, account ids, or ARNs — the scripts resolve them at
   runtime from stack outputs.
 
@@ -207,9 +199,8 @@ aws cloudformation delete-stack --stack-name selfmanaged-kafka
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for how to report a
-security issue. This is reference/demo software: the CloudFormation parameter defaults
-are weak placeholders (see [Configuration](#configuration)) — override them and review
-the stacks before any real or long-lived deployment.
+security issue. This is reference/demo software — review and harden the stacks before
+any real or long-lived deployment.
 
 ## License
 

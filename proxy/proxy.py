@@ -11,8 +11,10 @@ standard OAuth token endpoint. Internally it:
      IAM identity), sent either as:
        - grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer   assertion=<STS JWT>   (IAM_JWT_BEARER)
        - grant_type=urn:ietf:params:oauth:grant-type:token-exchange  subject_token=<STS JWT>
-  2. Validates that STS JWT (claim checks always; optional signature verification
-     via the AWS STS OIDC JWKS when VALIDATE_STS_JWT=true).
+  2. Authenticates the caller by fully validating that STS JWT: the signature is
+     verified against the AWS STS JWKS of an allowlisted issuer, and the issuer,
+     audience, subject, expiry and lifetime claims are enforced. There is no
+     claim-only mode: unsigned claims are attacker-controlled and prove nothing.
   3. Exchanges it for a downstream OAuth Bearer token that the self-managed Kafka
      brokers trust, using one of two modes (EXCHANGE_MODE):
        - client_credentials : the proxy holds a client_id/secret at the IdP and
@@ -37,23 +39,33 @@ STS JWT; same output: an access_token string).
 
 CONFIGURATION (environment variables)
 -------------------------------------
-  IDP_TOKEN_ENDPOINT   Downstream IdP token endpoint (HTTPS).
-  IDP_CLIENT_ID        Client id used for the downstream mint / client auth.
-  IDP_CLIENT_SECRET    Client secret (store in Secrets Manager; inject at deploy).
-  IDP_SCOPE            Optional OAuth scope to request downstream.
-  IDP_CA_PEM           Optional PEM of a private CA that signed the IdP TLS cert.
-  EXCHANGE_MODE        "client_credentials" (default) or "token_exchange".
-  TRUSTED_ISSUERS      Comma-separated allowlist of STS issuer URLs (empty = any).
-  TRUSTED_AUDIENCES    Comma-separated allowlist of STS audiences (empty = any).
-  VALIDATE_STS_JWT     "true" verifies the STS JWT signature via JWKS (needs
-                       egress to the STS OIDC endpoint). "false" (default) does
-                       claim-only checks (iss/aud/exp/sub), suitable for a
-                       no-egress private subnet.
+The proxy refuses to start (raises at import) if any REQUIRED value is missing.
+
+  TRUSTED_ISSUERS       REQUIRED. Comma-separated STS issuer URLs to trust, i.e. the
+                        account's outbound identity federation issuer
+                        (`aws iam get-outbound-web-identity-federation-info`).
+  TRUSTED_AUDIENCES     REQUIRED. Comma-separated audiences; must include the
+                        audience the Replicator is configured to request.
+  TRUSTED_SUBJECTS      REQUIRED. Comma-separated IAM role ARNs allowed to obtain a
+                        token (the Replicator's service execution role).
+  ALLOWED_ALGORITHMS    Signing algorithms accepted. Default "RS256,ES384".
+  JWKS_SECRET_ARN       Secrets Manager secret holding {"<issuer>": <JWKS>, ...},
+                        kept fresh by a scheduled refresher. Use this when the proxy
+                        has no internet egress. If unset, the JWKS is fetched
+                        directly from each trusted issuer (needs egress).
+  IDP_TOKEN_ENDPOINT    Downstream IdP token endpoint (HTTPS).
+  IDP_CLIENT_SECRET_ARN Secrets Manager secret {"client_id": ..., "client_secret": ...}
+                        for the downstream IdP client.
+  IDP_CLIENT_ID         Optional override of the client id from the secret.
+  IDP_SCOPE             Optional OAuth scope to request downstream.
+  IDP_CA_PEM            Optional PEM of a private CA that signed the IdP TLS cert.
+  EXCHANGE_MODE         "client_credentials" (default) or "token_exchange".
 """
 
 import base64
 import json
 import os
+import re
 import tempfile
 import time
 from urllib.parse import parse_qs
@@ -67,18 +79,60 @@ GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
 SUBJECT_TOKEN_TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt"
 
 # --- Configuration -----------------------------------------------------------
-TRUSTED_ISSUERS = [x.strip() for x in os.environ.get("TRUSTED_ISSUERS", "").split(",") if x.strip()]
-TRUSTED_AUDIENCES = [x.strip() for x in os.environ.get("TRUSTED_AUDIENCES", "").split(",") if x.strip()]
-VALIDATE_STS_JWT = os.environ.get("VALIDATE_STS_JWT", "false").lower() == "true"
+
+
+def _csv(name, default=""):
+    return [x.strip() for x in os.environ.get(name, default).split(",") if x.strip()]
+
+
+TRUSTED_ISSUERS = _csv("TRUSTED_ISSUERS")
+TRUSTED_AUDIENCES = _csv("TRUSTED_AUDIENCES")
+TRUSTED_SUBJECTS = _csv("TRUSTED_SUBJECTS")
+ALLOWED_ALGORITHMS = _csv("ALLOWED_ALGORITHMS", "RS256,ES384")
+JWKS_SECRET_ARN = os.environ.get("JWKS_SECRET_ARN", "")
 
 IDP_TOKEN_ENDPOINT = os.environ.get("IDP_TOKEN_ENDPOINT", "")
+IDP_CLIENT_SECRET_ARN = os.environ.get("IDP_CLIENT_SECRET_ARN", "")
 IDP_CLIENT_ID = os.environ.get("IDP_CLIENT_ID", "")
-IDP_CLIENT_SECRET = os.environ.get("IDP_CLIENT_SECRET", "")
 IDP_SCOPE = os.environ.get("IDP_SCOPE", "")
 IDP_CA_PEM = os.environ.get("IDP_CA_PEM", "")
 EXCHANGE_MODE = os.environ.get("EXCHANGE_MODE", "client_credentials").lower()
 
 JWKS_CACHE_TTL = 300
+JWKS_MIN_REFRESH_INTERVAL = 30  # bound forced refreshes on unknown kids
+SECRET_CACHE_TTL = 300
+MAX_TOKEN_LIFETIME = 3600       # GetWebIdentityToken DurationSeconds maximum
+CLOCK_SKEW_LEEWAY = 30
+
+_SUPPORTED_ALGORITHMS = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+
+
+def _config_errors():
+    errors = []
+    if not TRUSTED_ISSUERS:
+        errors.append("TRUSTED_ISSUERS is required")
+    if any(not i.startswith("https://") for i in TRUSTED_ISSUERS):
+        errors.append("TRUSTED_ISSUERS entries must be https:// URLs")
+    if not TRUSTED_AUDIENCES:
+        errors.append("TRUSTED_AUDIENCES is required")
+    if not TRUSTED_SUBJECTS:
+        errors.append("TRUSTED_SUBJECTS is required")
+    if not ALLOWED_ALGORITHMS or not set(ALLOWED_ALGORITHMS) <= _SUPPORTED_ALGORITHMS:
+        errors.append(f"ALLOWED_ALGORITHMS must be a subset of {sorted(_SUPPORTED_ALGORITHMS)}")
+    if EXCHANGE_MODE not in ("client_credentials", "token_exchange"):
+        errors.append("EXCHANGE_MODE must be client_credentials or token_exchange")
+    if EXCHANGE_MODE == "client_credentials" and not IDP_CLIENT_SECRET_ARN:
+        errors.append("IDP_CLIENT_SECRET_ARN is required for EXCHANGE_MODE=client_credentials")
+    if not IDP_TOKEN_ENDPOINT.startswith("https://"):
+        errors.append("IDP_TOKEN_ENDPOINT must be an https:// URL")
+    return errors
+
+
+# Fail closed: a misconfigured proxy must not start, rather than start and
+# accept tokens it cannot properly authenticate.
+_errors = _config_errors()
+if _errors:
+    raise RuntimeError("Federation proxy misconfigured: " + "; ".join(_errors))
 
 # Write the IdP CA to a temp file once so `requests` can trust a private CA.
 _CA_FILE = None
@@ -89,88 +143,148 @@ if IDP_CA_PEM:
 
 _verify = _CA_FILE or True
 
-_jwks_cache, _jwks_time = {}, {}
+_jwks = {"keys_by_issuer": {}, "fetched_at": 0.0}
+_secret_cache = {}
+_sm_client = None
+
+
+# --- AWS helpers -------------------------------------------------------------
+
+def _get_secret_json(arn):
+    """Read and cache a JSON secret from Secrets Manager (reached through the
+    VPC's Secrets Manager interface endpoint)."""
+    global _sm_client
+    cached = _secret_cache.get(arn)
+    if cached and time.time() - cached[0] < SECRET_CACHE_TTL:
+        return cached[1]
+    if _sm_client is None:
+        import boto3  # provided by the Lambda runtime
+        _sm_client = boto3.client("secretsmanager")
+    value = json.loads(_sm_client.get_secret_value(SecretId=arn)["SecretString"])
+    _secret_cache[arn] = (time.time(), value)
+    return value
 
 
 # --- STS JWT validation ------------------------------------------------------
 
 def _unverified_claims(token):
-    """Read a JWT's claims WITHOUT verifying the signature, by base64url-decoding
-    the payload segment directly.
+    """Read a JWT's claims WITHOUT verifying the signature.
 
-    Used only for the pre-signature claim checks (issuer/audience/expiry/subject)
-    and to locate the signing key. When VALIDATE_STS_JWT is enabled the token is
-    afterwards re-decoded with full signature verification.
+    Used ONLY to pick which allowlisted issuer's key set to verify against.
+    Nothing read here is trusted: every claim is re-checked by `jwt.decode`
+    after the signature has been verified.
     """
     parts = token.split(".")
-    if len(parts) < 2:
+    if len(parts) != 3:
         raise ValueError("Malformed JWT")
     payload_b64 = parts[1]
     payload_b64 += "=" * (-len(payload_b64) % 4)  # restore base64 padding
-    return json.loads(base64.urlsafe_b64decode(payload_b64))
+    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+    if not isinstance(claims, dict):
+        raise ValueError("Malformed JWT")
+    return claims
 
 
-def _fetch_jwks(issuer):
+def _load_jwks():
+    """Return {issuer: jwks} for the trusted issuers only.
+
+    Keys are never fetched from a URL taken from the token: only from the
+    refresher-maintained secret or from the configured TRUSTED_ISSUERS.
+    """
+    if JWKS_SECRET_ARN:
+        _secret_cache.pop(JWKS_SECRET_ARN, None)
+        stored = _get_secret_json(JWKS_SECRET_ARN)
+        return {iss: stored[iss] for iss in TRUSTED_ISSUERS if iss in stored}
+    out = {}
+    for iss in TRUSTED_ISSUERS:
+        resp = requests.get(f"{iss.rstrip('/')}/.well-known/jwks.json", timeout=10)
+        resp.raise_for_status()
+        out[iss] = resp.json()
+    return out
+
+
+def _signing_key(issuer, kid, alg, allow_refresh=True):
     now = time.time()
-    if issuer in _jwks_cache and now - _jwks_time.get(issuer, 0) < JWKS_CACHE_TTL:
-        return _jwks_cache[issuer]
-    disc_resp = requests.get(f"{issuer}/.well-known/openid-configuration", timeout=10)
-    disc_resp.raise_for_status()
-    disc = disc_resp.json()
-    jwks_resp = requests.get(disc.get("jwks_uri", f"{issuer}/.well-known/jwks.json"), timeout=10)
-    jwks_resp.raise_for_status()
-    jwks = jwks_resp.json()
-    _jwks_cache[issuer], _jwks_time[issuer] = jwks, now
-    return jwks
+    if now - _jwks["fetched_at"] >= JWKS_CACHE_TTL:
+        _jwks["keys_by_issuer"], _jwks["fetched_at"] = _load_jwks(), now
+    keys = _jwks["keys_by_issuer"].get(issuer, {}).get("keys", [])
+    kd = next((k for k in keys if k.get("kid") == kid), None)
+    if kd is None:
+        # Possibly a key rotation: refresh once, rate-limited.
+        if allow_refresh and now - _jwks["fetched_at"] >= JWKS_MIN_REFRESH_INTERVAL:
+            _jwks["fetched_at"] = 0.0
+            return _signing_key(issuer, kid, alg, allow_refresh=False)
+        raise ValueError(f"No trusted signing key for kid {kid}")
+    if kd.get("alg") and kd["alg"] != alg:
+        raise ValueError("Token alg does not match the signing key")
+    return jwt.PyJWK(kd, algorithm=alg).key  # raises if the key type does not fit alg
+
+
+_ROLE_ARN = re.compile(r"^arn:(aws[a-z-]*):iam::(\d{12}):role/(?:[^/]+/)*([\w+=,.@-]+)$")
+
+
+def _role_key(arn):
+    m = _ROLE_ARN.match(arn or "")
+    return m.groups() if m else None
+
+
+# IAM role names are unique per account regardless of path, so a role is
+# matched on (partition, account, name). This tolerates the role path being
+# present in TRUSTED_SUBJECTS but not in the STS `sub` claim, or vice versa.
+_TRUSTED_ROLE_KEYS = {k for k in map(_role_key, TRUSTED_SUBJECTS) if k}
+
+
+def _subject_trusted(sub):
+    if sub in TRUSTED_SUBJECTS:
+        return True
+    key = _role_key(sub)
+    return key is not None and key in _TRUSTED_ROLE_KEYS
 
 
 def validate_sts_jwt(token):
-    """Validate the AWS STS JWT presented by the Replicator.
+    """Authenticate the caller from the AWS STS JWT presented by the Replicator.
 
-    Claim checks (issuer allowlist, audience allowlist, expiry, and that the
-    subject is an AWS ARN) always run. Signature verification via the issuer's
-    JWKS is optional (VALIDATE_STS_JWT) so the proxy can run in a subnet without
-    internet egress. Returns the decoded claims on success; raises ValueError
-    otherwise.
+    The signature is always verified against the JWKS of an allowlisted issuer,
+    then issuer, audience, expiry, issued-at, lifetime and subject are enforced.
+    Returns the verified claims on success; raises ValueError (or a PyJWT
+    error) otherwise.
     """
     header = jwt.get_unverified_header(token)
-    payload = _unverified_claims(token)
+    alg, kid = header.get("alg"), header.get("kid")
+    if alg not in ALLOWED_ALGORITHMS:
+        raise ValueError(f"Disallowed signing algorithm: {alg}")
+    if not kid:
+        raise ValueError("Missing kid")
 
-    issuer = payload.get("iss")
-    if not issuer:
-        raise ValueError("Missing iss claim")
-    if TRUSTED_ISSUERS and issuer not in TRUSTED_ISSUERS:
-        raise ValueError(f"Untrusted issuer: {issuer}")
-    if TRUSTED_AUDIENCES:
-        aud = payload.get("aud")
-        auds = aud if isinstance(aud, list) else [aud]
-        if not any(a in TRUSTED_AUDIENCES for a in auds):
-            raise ValueError(f"Untrusted audience: {aud}")
-    if payload.get("exp") and payload["exp"] < time.time():
-        raise ValueError("Token expired")
-    if not str(payload.get("sub", "")).startswith("arn:aws:"):
-        raise ValueError(f"Subject is not an AWS ARN: {payload.get('sub')}")
+    issuer = _unverified_claims(token).get("iss")
+    if issuer not in TRUSTED_ISSUERS:
+        raise ValueError("Untrusted issuer")
 
-    if VALIDATE_STS_JWT:
-        from jwt.algorithms import RSAAlgorithm, ECAlgorithm
-        kid, alg = header.get("kid"), header.get("alg")
-        if not kid or not alg:
-            raise ValueError("Missing kid or alg for signature verification")
-        jwks = _fetch_jwks(issuer)
-        kd = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
-        if not kd:
-            raise ValueError(f"No JWKS key for kid {kid}")
-        pk = (RSAAlgorithm.from_jwk(json.dumps(kd)) if kd.get("kty") == "RSA"
-              else ECAlgorithm.from_jwk(json.dumps(kd)))
-        payload = jwt.decode(
-            token, pk, algorithms=[alg],
-            audience=TRUSTED_AUDIENCES or None,
-            options={"verify_aud": bool(TRUSTED_AUDIENCES), "verify_exp": True},
-        )
-    return payload
+    claims = jwt.decode(
+        token,
+        _signing_key(issuer, kid, alg),
+        algorithms=[alg],
+        issuer=issuer,
+        audience=TRUSTED_AUDIENCES,
+        leeway=CLOCK_SKEW_LEEWAY,
+        options={"require": ["iss", "aud", "sub", "exp", "iat"]},
+    )
+    if claims["exp"] - claims["iat"] > MAX_TOKEN_LIFETIME:
+        raise ValueError("Token lifetime exceeds maximum")
+    if not _subject_trusted(claims["sub"]):
+        raise ValueError(f"Untrusted subject: {claims['sub']}")
+    return claims
 
 
 # --- Downstream token acquisition -------------------------------------------
+
+def _idp_client_credentials():
+    """(client_id, client_secret) for the downstream IdP, from Secrets Manager."""
+    if not IDP_CLIENT_SECRET_ARN:
+        return IDP_CLIENT_ID, ""
+    creds = _get_secret_json(IDP_CLIENT_SECRET_ARN)
+    return IDP_CLIENT_ID or creds.get("client_id", ""), creds.get("client_secret", "")
+
 
 def exchange_for_downstream_token(sts_jwt, claims):
     """Obtain a downstream OAuth Bearer token the self-managed Kafka trusts.
@@ -184,6 +298,7 @@ def exchange_for_downstream_token(sts_jwt, claims):
     SOURCE Kafka and generally has no meaning at the downstream IdP, so forwarding
     it would break IdPs that validate scope names.
     """
+    client_id, client_secret = _idp_client_credentials()
     if EXCHANGE_MODE == "token_exchange":
         # RFC 8693 token exchange: forward the STS JWT to an IdP that federates
         # AWS STS as an external issuer. The IdP validates it and returns its own
@@ -194,17 +309,17 @@ def exchange_for_downstream_token(sts_jwt, claims):
             "subject_token_type": SUBJECT_TOKEN_TYPE_JWT,
             "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
         }
-        if IDP_CLIENT_ID:
-            data["client_id"] = IDP_CLIENT_ID
-        if IDP_CLIENT_SECRET:
-            data["client_secret"] = IDP_CLIENT_SECRET
+        if client_id:
+            data["client_id"] = client_id
+        if client_secret:
+            data["client_secret"] = client_secret
     else:
         # client_credentials (default): the proxy holds a downstream client and
         # mints a token on the validated identity's behalf. Fully self-contained.
         data = {
             "grant_type": "client_credentials",
-            "client_id": IDP_CLIENT_ID,
-            "client_secret": IDP_CLIENT_SECRET,
+            "client_id": client_id,
+            "client_secret": client_secret,
         }
     if IDP_SCOPE:
         data["scope"] = IDP_SCOPE
@@ -244,16 +359,22 @@ def handler(event, context):
             "error_description": "assertion/subject_token (STS JWT) is required",
         })
 
+    # Failure details are logged, not returned, so callers cannot use the error
+    # text to probe the validation rules or read IdP responses.
     try:
         claims = validate_sts_jwt(sts_jwt)
-    except Exception as e:  # noqa: BLE001 - surface as OAuth error
-        return _respond(401, {"error": "invalid_grant", "error_description": str(e)})
-    print(f"Validated STS identity: {claims.get('sub')}")
+    except Exception as e:  # noqa: BLE001 - every failure is an OAuth invalid_grant
+        print(f"Rejected STS JWT: {type(e).__name__}: {e}")
+        return _respond(401, {"error": "invalid_grant",
+                              "error_description": "STS JWT validation failed"})
+    print(f"Validated STS identity: {claims['sub']}")
 
     try:
         tok = exchange_for_downstream_token(sts_jwt, claims)
     except Exception as e:  # noqa: BLE001
-        return _respond(502, {"error": "server_error", "error_description": str(e)})
+        print(f"Downstream token request failed: {type(e).__name__}: {e}")
+        return _respond(502, {"error": "server_error",
+                              "error_description": "downstream token request failed"})
 
     return _respond(200, {
         "access_token": tok["access_token"],
